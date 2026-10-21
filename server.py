@@ -95,6 +95,11 @@ def load_config():
 
 CFG = load_config()
 BUS = Path(CFG["bus_dir"]).expanduser() if CFG.get("bus_dir") else HERE
+# WRITE side of an otherwise read-only bus -- deliberately its own file,
+# never one of the four backtalk already owns, so the "READ-ONLY on the
+# signal bus" contract above stays true for those. backtalk's own watcher
+# (main.py) polls this one file to know whether to cut its own audio.
+_MUTE_FILE = BUS / ".voice_mute_request"
 
 MOCK = None
 NO_OPEN = "--no-open" in sys.argv
@@ -139,6 +144,8 @@ def mock_bus():
         ]
     return {"state": MOCK, "level": level, "samples": samples,
             "alert": False, "loading": MOCK == "thinking",
+            "context_usage": {"percentage": 48, "used": 96000,
+                              "max": 200000, "ts": t},
             # Faked so the usage readout can be looked at without
             # spending a real session to make it appear.
             "rate_limits": {
@@ -183,8 +190,19 @@ def read_bus():
         rate_limits = json.loads((BUS / ".voice_rate_limits").read_text())
     except (OSError, ValueError):
         pass
+    context_usage = {}
+    try:
+        payload = json.loads((BUS / ".voice_context").read_text())
+        if isinstance(payload, dict):
+            context_usage = payload
+    except (OSError, ValueError):
+        pass
+    muted = _MUTE_FILE.read_text().strip() == "1" if _MUTE_FILE.exists() \
+        else False
     return {"state": state, "level": level, "samples": samples,
-            "alert": alert, "loading": loading, "rate_limits": rate_limits}
+            "alert": alert, "loading": loading, "rate_limits": rate_limits,
+            "context_usage": context_usage,
+            "muted": muted}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -221,6 +239,26 @@ class Handler(BaseHTTPRequestHandler):
                 # left to tell; saying so twice helps no one.
                 pass
 
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        try:
+            if path == "/mute":
+                was_muted = (_MUTE_FILE.exists()
+                             and _MUTE_FILE.read_text().strip() == "1")
+                _MUTE_FILE.write_text("0" if was_muted else "1")
+                self._send(json.dumps({"muted": not was_muted}).encode(),
+                           "application/json")
+            else:
+                self._send(b"not found", "text/plain", 404)
+        except ConnectionError:
+            pass
+        except Exception as e:
+            body = json.dumps({"error": str(e)}).encode()
+            try:
+                self._send(body, "application/json", 500)
+            except ConnectionError:
+                pass
+
     def _static(self, path):
         if path == "/":
             path = "/index.html"
@@ -247,6 +285,41 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):
         pass
+
+
+def _open_app_window(url):
+    """Open the face in a chrome-less app window instead of a normal
+    browser tab. Edge/Chrome's --app= mode strips the tabs, address
+    bar, and all browser chrome, so it reads as its own self-contained
+    window rather than a tab buried in the browser. Falls back to a
+    plain tab if neither browser can be found — local-only feature,
+    never worth failing the whole launch over."""
+    import shutil
+    import subprocess
+    candidates = [
+        shutil.which("msedge"),
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        shutil.which("chrome"),
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    ]
+    # GPU compositing was landing disabled for this window (found
+    # 2026-08-31 -- a live renderer was pegging a full CPU core drawing
+    # the board face in software). Traced past two wrong guesses (a
+    # driver blocklist, then Edge-vs-Chrome) to the real cause: launching
+    # into the person's DEFAULT browser profile inherits whatever that
+    # profile's own hardware-acceleration setting is, and it was off
+    # there. A dedicated profile -- same trick already used for the
+    # Playwright browser tool -- starts with acceleration on by default
+    # and never touches the person's real profile at all.
+    profile_dir = HERE / ".browser-profile"
+    extra_args = [f"--user-data-dir={profile_dir}",
+                  "--ignore-gpu-blocklist", "--enable-gpu-rasterization",
+                  "--disable-software-rasterizer"]
+    for exe in candidates:
+        if exe and Path(exe).exists():
+            subprocess.Popen([exe, f"--app={url}", *extra_args])
+            return
+    webbrowser.open(url)
 
 
 if __name__ == "__main__":
@@ -278,7 +351,7 @@ if __name__ == "__main__":
         if mine:
             print(f"already running at {root}  opening it instead", flush=True)
             if not NO_OPEN:
-                webbrowser.open(url)
+                _open_app_window(url)
             sys.exit(0)
         print(f"port {PORT} is taken by something that is not this server.",
               flush=True)
@@ -288,7 +361,7 @@ if __name__ == "__main__":
     srv.allow_reuse_address = True
     print(f"ai-visualizer on {root}  opening {url}  ({mode})  Ctrl-C stops", flush=True)
     if not NO_OPEN:
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.6, lambda: _open_app_window(url)).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

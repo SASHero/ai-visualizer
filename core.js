@@ -93,11 +93,14 @@ const AV = (() => {
   /* ------------------------------ bus polling ------------------------------ */
   let raw = { state: "idle", level: 0, samples: null, alert: false,
               loading: false };
+  let lastBusRead = 0;
   if (!DEMO) {
     setInterval(async () => {
       try {
         const r = await fetch("/state", { cache: "no-store" });
         raw = await r.json();
+        lastBusRead = Date.now();
+        if (!!raw.muted !== A._muted) { A._muted = !!raw.muted; paintMuteBtn(); }
       } catch (e) { /* server gone: hold last state */ }
     }, 120);
   }
@@ -151,6 +154,8 @@ const AV = (() => {
     // Empty unless the voice line was told to publish usage. A face that
     // wants to draw it reads AV.rateLimits; every other face ignores it.
     A.rateLimits = raw.rate_limits || {};
+    A.contextUsage = lastBusRead && Date.now() - lastBusRead < 5000
+      ? raw.context_usage : null;
     A.level = raw.level || 0;
 
     // adaptive envelope: normalize against a decaying peak, then ease
@@ -257,6 +262,45 @@ const AV = (() => {
     if (audio && playing) { audio.pause(); audio.currentTime = 0; }
     playing = false;
   }
+
+  /* ------------------------------- audio mute ------------------------------- */
+  // Same reveal-on-hover mechanic as the SND button, but this one is real:
+  // it toggles backtalk's own spoken voice via /mute, not a local browser
+  // sound effect. server.py owns the actual mute file; this button and
+  // the bus-polling interval above just reflect and request state.
+  let muteBtn = null;
+  A._muted = false;
+  function muteInit() {
+    if (SHOT || DEMO) return;
+    muteBtn = document.createElement("div");
+    muteBtn.style.cssText =
+      "position:fixed;left:64px;bottom:58px;z-index:50;cursor:pointer;" +
+      "font:12px 'SF Mono',Menlo,Consolas,monospace;letter-spacing:.2em;" +
+      "color:#5a6a72;opacity:0;transition:opacity .4s;user-select:none;" +
+      "pointer-events:none";
+    muteBtn.title = "voice audio on/off";
+    let hideT = null;
+    addEventListener("mousemove", () => {
+      muteBtn.style.opacity = ".65";
+      muteBtn.style.pointerEvents = "auto";
+      clearTimeout(hideT);
+      hideT = setTimeout(() => {
+        muteBtn.style.opacity = "0";
+        muteBtn.style.pointerEvents = "none";
+      }, 3000);
+    });
+    muteBtn.onclick = () => {
+      fetch("/mute", { method: "POST" })
+        .then(r => r.json())
+        .then(d => { A._muted = !!d.muted; paintMuteBtn(); })
+        .catch(() => {});
+    };
+    paintMuteBtn();
+    document.body.appendChild(muteBtn);
+  }
+  function paintMuteBtn() {
+    if (muteBtn) muteBtn.textContent = A._muted ? "AUDIO OFF" : "AUDIO ON";
+  }
   function soundUpdate() {
     if (!audio || !A._sndWant) return;
     const want = A._sndOn && A.state === "thinking" && !raw.loading;
@@ -293,6 +337,7 @@ const AV = (() => {
     A._mic = !!opts.mic;
     if (A._mic && !DEMO) micStart();
     if (opts.sound !== false) soundInit(); else A._sndWant = false;
+    muteInit();
     if (DEMO) {
       applyConfig({ name: Q.get("name") || "JARVIS" });
     } else {
@@ -335,6 +380,21 @@ const AV = (() => {
   U.usageRows = () => {
     const rl = A.rateLimits || {};
     const out = [];
+    // One glanceable context gauge, shared by all four faces. Keep its
+    // complete text in one column to fit the narrow canvas HUDs too.
+    const contextPct = A.contextUsage && A.contextUsage.percentage;
+    const contextKnown = typeof contextPct === "number"
+      && Number.isFinite(contextPct) && contextPct >= 0 && contextPct <= 100;
+    const contextRounded = contextKnown ? Math.round(contextPct) : null;
+    const filled = contextKnown ? Math.round(contextPct * 8 / 100) : 0;
+    out.push({
+      label: "", pct: contextRounded, known: contextKnown,
+      hot: contextKnown && contextPct >= 80,
+      text: "CONTEXT " + (contextKnown
+        ? "\u25a0".repeat(filled) + "\u25a1".repeat(8 - filled)
+          + " " + contextRounded + "%"
+        : "\u2014")
+    });
     for (const [label, w] of [["5H", rl.five_hour], ["7D", rl.seven_day]]) {
       if (!w) continue;
       const known = w.utilization != null;
